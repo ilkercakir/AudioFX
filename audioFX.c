@@ -9,8 +9,12 @@ GtkWidget *window;
 GtkWidget *fxbox;
 GtkWidget *confbox;
 GtkWidget *frameconf;
+GtkWidget *inputdevlabel;
+GtkWidget *comboinputdev;
 GtkWidget *frameslabel;
 GtkWidget *spinbutton1;
+GtkWidget *outputdevlabel;
+GtkWidget *combooutputdev;
 
 GtkWidget *framehaas1;
 GtkWidget *haasenable;
@@ -27,6 +31,9 @@ GtkWidget *delaytypelabel;
 GtkWidget *combodelaytype;
 GtkWidget *feedbacklabel1;
 GtkWidget *spinbutton6;
+
+GtkWidget *statusbar;
+gint context_id;
 
 long long usecs; // microseconds
 long diff1;
@@ -55,6 +62,18 @@ long get_next_time_microseconds()
     delta = micros - usecs;
     usecs = micros;
     return(delta);
+}
+
+static void push_message(GtkWidget *widget, gint cid, char *msg)
+{
+  gchar *buff = g_strdup_printf("%s", msg);
+  gtk_statusbar_push(GTK_STATUSBAR(statusbar), cid, buff);
+  g_free(buff);
+}
+
+static void pop_message(GtkWidget *widget, gint cid)
+{
+  gtk_statusbar_pop(GTK_STATUSBAR(widget), cid);
 }
 
 // Delay Processor
@@ -392,7 +411,7 @@ float aq_getdelay(struct audioqueue *q)
 // recorder thread
 struct microphone
 {
-	char* device;
+	char device[32];
 	snd_pcm_format_t format;
 	unsigned int rate;
 	unsigned int channels;
@@ -472,7 +491,13 @@ static gpointer recorderthread(gpointer args)
 	pthread_setcanceltype(ctype, &ctype_old);
 
 	int err;
-	mic.device = "hw:1,0";
+
+	//mic.device = "hw:1,0";
+	gchar *strval;
+	g_object_get((gpointer)comboinputdev, "active-id", &strval, NULL);
+	strcpy(mic.device, strval);
+	g_free(strval);
+
 	mic.format = SND_PCM_FORMAT_S16_LE;
 	mic.rate = samplingrate;
 	mic.channels = aq.channels;
@@ -517,7 +542,7 @@ int bufsize = 10240; // persize * 10; // 10 periods
 struct speaker
 {
 	snd_pcm_t *handle;
-	char *device;	// playback device
+	char device[32];	// playback device
 	unsigned int rate;	// stream rate
 	snd_pcm_format_t format; // = SND_PCM_FORMAT_S16, sample format
 	unsigned int channels;		// count of channels
@@ -761,7 +786,12 @@ static gpointer playerthread(gpointer args)
 	int ctype_old;
 	pthread_setcanceltype(ctype, &ctype_old);
 
-	spk.device = "plughw:0,0";
+	//spk.device = "plughw:0,0";
+	gchar *strval;
+	g_object_get((gpointer)combooutputdev, "active-id", &strval, NULL);
+	strcpy(spk.device, strval);
+	g_free(strval);
+
 	spk.rate = aq.rate;
 	spk.format = samplingformat;
 	spk.channels = stereo;
@@ -828,6 +858,7 @@ static gpointer playerthread(gpointer args)
 static gpointer thread0(gpointer args)
 {
 	struct audioqueue *a = (struct audioqueue *)args;
+	char delayms[50];
 
 	int ctype = PTHREAD_CANCEL_ASYNCHRONOUS;
 	int ctype_old;
@@ -835,6 +866,9 @@ static gpointer thread0(gpointer args)
 
 	int frames = (int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spinbutton1));
 	aq_init(a, samplingformat, frames, samplingrate, mono, queueLength);
+
+	sprintf(delayms, "%5.2f ms delay, rate %d fps, %d queues", aq_getdelay(a)*1000.0, a->rate, queueLength);
+	push_message(statusbar, context_id, delayms);
 
 	Delay_initAll(samplingformat, samplingrate, stereo, &snddly);
 
@@ -894,6 +928,8 @@ void terminate_thread0(struct audioqueue *q)
 	if ((i=pthread_join(tid[0], NULL)))
 		printf("pthread_join error, tid[0], %d\n", i);
 	aq_destroy(q);
+
+	pop_message(statusbar, context_id);
 }
 
 static gboolean delete_event(GtkWidget *widget, GdkEvent *event, gpointer data)
@@ -914,12 +950,36 @@ static void realize_cb(GtkWidget *widget, gpointer data)
 	g_object_set((gpointer)combodelaytype, "active-id", "0", NULL);
 }
 
+static void inputdev_changed(GtkWidget *combo, gpointer data)
+{
+	gchar *strval;
+	struct audioqueue *a = (struct audioqueue*)data;
+
+	terminate_thread0(a);
+	g_object_get((gpointer)combo, "active-id", &strval, NULL);
+	//printf("Selected id %s\n", strval);
+	create_thread0(a);
+	g_free(strval);
+}
+
 static void frames_changed(GtkWidget *widget, gpointer data)
 {
 	struct audioqueue *a = (struct audioqueue*)data;
 
 	terminate_thread0(a);
 	create_thread0(a);
+}
+
+static void outputdev_changed(GtkWidget *combo, gpointer data)
+{
+	gchar *strval;
+	struct audioqueue *a = (struct audioqueue*)data;
+
+	terminate_thread0(a);
+	g_object_get((gpointer)combo, "active-id", &strval, NULL);
+	//printf("Selected id %s\n", strval);
+	create_thread0(a);
+	g_free(strval);
 }
 
 static void haas_toggled(GtkWidget *togglebutton, gpointer data)
@@ -1018,6 +1078,127 @@ static void feedback_changed(GtkWidget *widget, gpointer data)
 	pthread_mutex_unlock(&(snddly.delaymutex));
 }
 
+void print_card_list(void)
+{
+	int status, count = 0;
+	int card = -1;  // use -1 to prime the pump of iterating through card list
+	char* longname  = NULL;
+	char* shortname = NULL;
+	char name[32];
+	char devicename[32];
+	//const char* subname;
+	snd_ctl_t *ctl;
+	snd_pcm_info_t *info;
+	int device;
+	int sub, foundsub, devicepreset;
+
+	do
+	{
+		if ((status = snd_card_next(&card)) < 0)
+		{
+			printf("cannot determine card number: %s\n", snd_strerror(status));
+			break;
+		}
+		if (card<0) break;
+		//printf("Card %d:", card);
+		if ((status = snd_card_get_name(card, &shortname)) < 0)
+		{
+			printf("cannot determine card shortname: %s\n", snd_strerror(status));
+			break;
+		}
+		if ((status = snd_card_get_longname(card, &longname)) < 0)
+		{
+			printf("cannot determine card longname: %s\n", snd_strerror(status));
+			break;
+		}
+		//printf("\tLONG NAME:  %s\n", longname);
+		//printf("\tSHORT NAME: %s\n", shortname);
+
+		sprintf(name, "hw:%d", card);
+		if ((status = snd_ctl_open(&ctl, name, 0)) < 0)
+		{
+			printf("cannot open control for card %d: %s\n", card, snd_strerror(status));
+			return;
+		}
+
+		device = -1;
+		do
+		{
+			status = snd_ctl_pcm_next_device(ctl, &device);
+			if (status < 0)
+			{
+				printf("cannot determine device number: %s\n", snd_strerror(status));
+				break;
+			}
+			if (device<0) break;
+			//printf("Device %s,%d\n", name, device);
+			snd_pcm_info_malloc(&info);
+			snd_pcm_info_set_device(info, (unsigned int)device);
+
+			snd_pcm_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
+			snd_ctl_pcm_info(ctl, info);
+			int subs_in = snd_pcm_info_get_subdevices_count(info);
+			//printf("Input subdevices : %d\n", subs_in);
+			for(sub=0,foundsub=0,devicepreset=0;sub<subs_in;sub++)
+			{
+				snd_pcm_info_set_subdevice(info, sub);
+				if ((status = snd_ctl_pcm_info(ctl, info)) < 0)
+				{
+					//printf("cannot get pcm information %d:%d:%d: %s\n", card, device, sub, snd_strerror(status));
+					continue;
+				}
+				//subname = snd_pcm_info_get_subdevice_name(info);
+				//printf("Subdevice %d name : %s\n", sub, subname);
+				foundsub = 1;
+			}
+			if (foundsub)
+			{
+				sprintf(devicename, "hw:%d,%d", card, device);
+				gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(comboinputdev), devicename, shortname);
+				if (!devicepreset)
+				{
+					devicepreset = 1;
+					g_object_set((gpointer)comboinputdev, "active-id", devicename, NULL);
+				}
+			}
+
+			snd_pcm_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
+			snd_ctl_pcm_info(ctl, info);
+			int subs_out = snd_pcm_info_get_subdevices_count(info);
+			//printf("Output subdevices : %d\n", subs_out);
+			for(sub=0,foundsub=0,devicepreset=0;sub<subs_out;sub++)
+			{
+				snd_pcm_info_set_subdevice(info, sub);
+				if ((status = snd_ctl_pcm_info(ctl, info)) < 0)
+				{
+					//printf("cannot get pcm information %d:%d:%d: %s\n", card, device, sub, snd_strerror(status));
+					continue;
+				}
+				//subname = snd_pcm_info_get_subdevice_name(info);
+				//printf("Subdevice %d name : %s\n", sub, subname);
+				foundsub = 1;
+			}
+			if (foundsub)
+			{
+				sprintf(devicename, "hw:%d,%d", card, device);
+				gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combooutputdev), devicename, shortname);
+				if (!devicepreset)
+				{
+					devicepreset = 1;
+					g_object_set((gpointer)combooutputdev, "active-id", devicename, NULL);
+				}
+			}
+
+			snd_pcm_info_free(info);
+		}
+		while(1);
+		//printf("\n");
+		count++;
+	}
+	while (1);
+	//printf("%d cards found\n", count);
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -1061,6 +1242,13 @@ int main(int argc, char *argv[])
 	confbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
 	gtk_container_add(GTK_CONTAINER(frameconf), confbox);
 
+// input devices combobox
+	inputdevlabel = gtk_label_new("Input Device");
+	gtk_widget_set_size_request(inputdevlabel, 100, 30);
+	gtk_container_add(GTK_CONTAINER(confbox), inputdevlabel);
+	comboinputdev = gtk_combo_box_text_new();
+	gtk_container_add(GTK_CONTAINER(confbox), comboinputdev);
+
 // frames
 	frameslabel = gtk_label_new("Frames");
 	gtk_widget_set_size_request(frameslabel, 100, 30);
@@ -1071,13 +1259,25 @@ int main(int argc, char *argv[])
 	g_signal_connect(GTK_SPIN_BUTTON(spinbutton1), "value-changed", G_CALLBACK(frames_changed), (gpointer)&aq);
 	gtk_container_add(GTK_CONTAINER(confbox), spinbutton1);
 
+// output devices combobox
+	outputdevlabel = gtk_label_new("Output Device");
+	gtk_widget_set_size_request(outputdevlabel, 100, 30);
+	gtk_container_add(GTK_CONTAINER(confbox), outputdevlabel);
+	combooutputdev = gtk_combo_box_text_new();
+	gtk_container_add(GTK_CONTAINER(confbox), combooutputdev);
+
+	print_card_list(); // Fill input/output devices combo boxes
+	g_signal_connect(GTK_COMBO_BOX(comboinputdev), "changed", G_CALLBACK(inputdev_changed), (gpointer)&aq);
+	g_signal_connect(GTK_COMBO_BOX(combooutputdev), "changed", G_CALLBACK(outputdev_changed), (gpointer)&aq);
+
+
 // haas frame
-    framehaas1 = gtk_frame_new("Haas");
-    gtk_container_add(GTK_CONTAINER(fxbox), framehaas1);
+	framehaas1 = gtk_frame_new("Haas");
+	gtk_container_add(GTK_CONTAINER(fxbox), framehaas1);
 
 // horizontal box
-    haasbox1 = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_container_add(GTK_CONTAINER(framehaas1), haasbox1);
+	haasbox1 = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 5);
+	gtk_container_add(GTK_CONTAINER(framehaas1), haasbox1);
 
 	haasenable = gtk_check_button_new_with_label("Haas");
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(haasenable), haasenabled);
@@ -1094,9 +1294,10 @@ int main(int argc, char *argv[])
 	g_signal_connect(GTK_SPIN_BUTTON(spinbutton2), "value-changed", G_CALLBACK(haasdly_changed), NULL);
 	gtk_container_add(GTK_CONTAINER(haasbox1), spinbutton2);
 
+
 // delay frame
-    framedelay1 = gtk_frame_new("Delay");
-    gtk_container_add(GTK_CONTAINER(fxbox), framedelay1);
+	framedelay1 = gtk_frame_new("Delay");
+	gtk_container_add(GTK_CONTAINER(fxbox), framedelay1);
 
 // horizontal box
     dlybox1 = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 5);
@@ -1117,10 +1318,10 @@ int main(int argc, char *argv[])
 	delaytypelabel = gtk_label_new("Delay Type");
 	gtk_widget_set_size_request(delaytypelabel, 100, 30);
 	gtk_container_add(GTK_CONTAINER(dlybox1), delaytypelabel);
-    combodelaytype = gtk_combo_box_text_new();
-    select_delay_types();
-    g_signal_connect(GTK_COMBO_BOX(combodelaytype), "changed", G_CALLBACK(delaytype_changed), NULL);
-    gtk_container_add(GTK_CONTAINER(dlybox1), combodelaytype);
+	combodelaytype = gtk_combo_box_text_new();
+	select_delay_types();
+	g_signal_connect(GTK_COMBO_BOX(combodelaytype), "changed", G_CALLBACK(delaytype_changed), NULL);
+	gtk_container_add(GTK_CONTAINER(dlybox1), combodelaytype);
 
 // delay
 	delaylabel1 = gtk_label_new("Delay (ms)");
@@ -1142,6 +1343,10 @@ int main(int argc, char *argv[])
 	g_signal_connect(GTK_SPIN_BUTTON(spinbutton6), "value-changed", G_CALLBACK(feedback_changed), NULL);
 	gtk_container_add(GTK_CONTAINER(dlybox1), spinbutton6);
 
+
+// statusbar
+	statusbar = gtk_statusbar_new();
+	gtk_container_add(GTK_CONTAINER(fxbox), statusbar);
 
 	gtk_widget_show_all(window);
 
