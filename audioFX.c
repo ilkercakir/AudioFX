@@ -1,3 +1,30 @@
+/* 
+ * Copyright 2017 Ilker Cakir
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA 02110-1301, USA.
+ * 
+ * 
+ */
+
+/*
+Using Geany Editor
+Compile with gcc -Wall -c "%f" $(pkg-config --cflags gtk+-3.0)
+Link with gcc -Wall -o "%e" "%f" $(pkg-config --cflags gtk+-3.0) -lpthread -lm $(pkg-config --libs gtk+-3.0) -lasound
+*/
+
 #define _GNU_SOURCE
 
 #include <alsa/asoundlib.h>
@@ -17,10 +44,18 @@ GtkWidget *outputdevlabel;
 GtkWidget *combooutputdev;
 
 GtkWidget *framehaas1;
-GtkWidget *haasenable;
 GtkWidget *haasbox1;
+GtkWidget *haasenable;
 GtkWidget *haaslabel1;
 GtkWidget *spinbutton2;
+
+GtkWidget *framemod1;
+GtkWidget *modbox1;
+GtkWidget *modenable;
+GtkWidget *modlabel1;
+GtkWidget *spinbutton14;
+GtkWidget *modlabel2;
+GtkWidget *spinbutton15;
 
 GtkWidget *framedelay1;
 GtkWidget *dlybox1;
@@ -234,6 +269,222 @@ void Delay_closeAll(struct sounddelay *s)
 	pthread_mutex_unlock(&(s->delaymutex));
 }
 
+
+// VFO
+
+struct soundvfo
+{
+	snd_pcm_format_t format; // SND_PCM_FORMAT_S16
+	unsigned int rate; // sampling rate
+	unsigned int channels; // channels
+	float vfofreq; // modulation frequency
+	float vfodepth; // modulation depth in percent 0..1.0
+	int invertphase; // invert phase of modulation
+	int enabled;
+
+	int N; // extra frames
+	char *vfobuf;
+	int physicalwidth;
+	int vfobufframes;
+	int vfobufsamples;
+	int framebytes;
+	int inbuffersamples;
+	int inbufferframes;
+	int front, rear;
+	int *framepos;
+	int frameindex;
+	int framei;
+	int framesinT;
+
+	int readfront;
+};
+
+struct soundvfo sndvfo;
+
+void soundvfo_init(float vfofreq, float vfodepth, int invertphase, snd_pcm_format_t format, unsigned int rate, unsigned int channels, struct soundvfo *v)
+{
+	v->format = format;
+	v->rate = rate;
+	v->channels = channels;
+	v->vfofreq = vfofreq;
+	v->vfodepth = vfodepth;
+	v->invertphase = invertphase;
+
+	v->vfobuf = NULL;
+	v->rear = v->front = 0;
+	v->framepos = NULL;
+	v->framei = 0;
+	v->frameindex = 0;
+
+	v->readfront = 0;
+}
+
+void soundvfo_add(char* inbuffer, int inbuffersize, struct soundvfo *v)
+{
+	float thetapos, thetaneg, tpos, tneg;
+
+	if (v->enabled)
+	{
+		if (!v->vfobuf)
+		{
+			v->physicalwidth = snd_pcm_format_width(v->format);
+			v->framebytes = v->physicalwidth / 8 * v->channels;
+			v->inbufferframes = inbuffersize / v->framebytes;
+			//v->N = ceil(v->inbufferframes * v->vfodepth);
+			v->N = ceil((float)v->rate/v->vfofreq*v->vfodepth);
+			v->inbuffersamples = v->inbufferframes * v->channels;
+			v->vfobufframes = v->inbufferframes + v->N;
+			v->vfobuf = malloc(v->vfobufframes * v->framebytes);
+			v->vfobufsamples = v->vfobufframes * v->channels;
+			memset(v->vfobuf, 0, v->vfobufframes * v->framebytes);
+			v->framepos = malloc(2*v->N*sizeof(int));
+			int k;
+			for(k=1;k<=v->N;k++)
+			{
+				thetapos = acos(1.0-2.0*k/v->N);
+				tpos = thetapos / (2 * M_PI * v->vfofreq);
+				v->framepos[k-1] = round(tpos * v->rate);
+			}
+			for(k=1;k<v->N;k++)
+			{
+				thetaneg = 2 * M_PI - acos(1.0-2.0*k/v->N);
+				tneg = thetaneg / (2 * M_PI * v->vfofreq);
+				v->framepos[2*v->N-1-k] = round(tneg * v->rate);
+			}
+			tneg = 1.0 / v->vfofreq;
+			v->framesinT = v->framepos[2*v->N-1] = round(tneg * v->rate);
+
+			v->framepos[2*v->N-1] = v->framesinT - 1;
+
+			if (v->invertphase)
+				v->frameindex = v->N;
+			//printf("frames to add %d, frames in T %d\n", v->N, v->framesinT);
+		}
+
+		int i, j, k, frameposition;
+		frameposition = v->framepos[v->frameindex];
+		signed short *inshort, *vfshort;
+		inshort = (signed short *)inbuffer;
+		vfshort = (signed short *)v->vfobuf;
+		for(i=0;i<v->inbufferframes;i++)
+		{
+			if (v->framei >= frameposition) // +- frame at this position
+			{
+				if (((v->frameindex < v->N) && (!v->invertphase))
+				 || ((v->frameindex >= v->N) && (v->invertphase))) // +
+				{
+					//vfshort[v->rear++] = inshort[i*v->channels]; // L
+					//vfshort[v->rear++] = inshort[i*v->channels+1]; // R
+					for(j=0,k=i*v->channels;j<v->channels;j++)
+						vfshort[v->rear++] = inshort[k++];
+					v->rear %= v->vfobufsamples;
+
+					//vfshort[v->rear++] = inshort[i*v->channels]; // L
+					//vfshort[v->rear++] = inshort[i*v->channels+1]; // R
+					for(j=0,k=i*v->channels;j<v->channels;j++)
+						vfshort[v->rear++] = inshort[k++];
+					v->rear %= v->vfobufsamples;
+				}
+				else // -
+				{
+				}
+				v->frameindex++;
+				v->frameindex%=2*v->N;
+				frameposition = v->framepos[v->frameindex];
+			}
+			else
+			{
+				//vfshort[v->rear++] = inshort[i*v->channels]; // L
+				//vfshort[v->rear++] = inshort[i*v->channels+1]; // R
+				for(j=0,k=i*v->channels;j<v->channels;j++)
+					vfshort[v->rear++] = inshort[k++];
+				v->rear %= v->vfobufsamples;
+			}
+			v->framei++;
+			v->framei %= v->framesinT;
+		}
+	}
+}
+
+void soundvfo_close(struct soundvfo *v)
+{
+	if (!v->vfobuf)
+	{
+		free(v->vfobuf);
+		v->vfobuf = NULL;
+		free(v->framepos);
+		v->framepos = NULL;
+	}
+}
+
+// Modulator
+
+struct soundmod
+{
+	snd_pcm_format_t format; // SND_PCM_FORMAT_S16
+	unsigned int rate; // sampling rate
+	unsigned int channels; // channels
+	float modfreq; // modulation frequency
+	float moddepth; // modulation depth in percent 0..1.0
+	int enabled;
+	pthread_mutex_t modmutex; // = PTHREAD_MUTEX_INITIALIZER;
+
+	struct soundvfo v;
+};
+
+struct soundmod sndmod;
+
+void soundmod_init(float modfreq, float moddepth, snd_pcm_format_t format, unsigned int rate, unsigned int channels, struct soundmod *m)
+{
+	m->format = format;
+	m->rate = rate;
+	m->channels = channels;
+	m->modfreq = modfreq;
+	m->moddepth = moddepth;
+	m->v.enabled = TRUE;
+	soundvfo_init(modfreq, moddepth, FALSE, format, rate, channels, &(m->v));
+}
+
+void soundmod_add(char* inbuffer, int inbuffersize, struct soundmod *m)
+{
+	int i, j;
+	signed short *inshort, *vfshort;
+
+	pthread_mutex_lock(&(m->modmutex));
+	if (m->enabled)
+	{
+		soundvfo_add(inbuffer, inbuffersize, &(m->v));
+		inshort = (signed short *)inbuffer;
+		vfshort = (signed short *)m->v.vfobuf;
+		for(i=0;i<m->v.inbuffersamples;)
+		{
+			for(j=0;j<m->channels;j++)
+				inshort[i++] = vfshort[m->v.readfront++];
+			m->v.readfront %= m->v.vfobufsamples;
+		}
+	}
+	pthread_mutex_unlock(&(m->modmutex));
+}
+
+void soundmod_close(struct soundmod *m)
+{
+	soundvfo_close(&(m->v));
+}
+
+void Modulator_initAll(snd_pcm_format_t format, float rate, unsigned int channels, struct soundmod *m)
+{
+	pthread_mutex_lock(&(m->modmutex));
+	soundmod_init((float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spinbutton14)), (float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spinbutton15)), format, rate, channels, m);
+	pthread_mutex_unlock(&(m->modmutex));
+}
+
+void Modulator_closeAll(struct soundmod *m)
+{
+	soundmod_close(m);
+}
+
+float modrate = 1.0;
+float moddepth = 0.003;
 
 // Audio circular queue
 pthread_t tid[3];
@@ -798,57 +1049,69 @@ static gpointer playerthread(gpointer args)
 	spk.resample = 1;
 	spk.period_event = 0;
 	spk.access = SND_PCM_ACCESS_RW_INTERLEAVED;
-	init_audio_spk(&spk);
 
-	int i, j, err;
-	int sbuffersize = aq.bufferframes * stereo * ( snd_pcm_format_width(aq.format) / 8 );
-	char *sbuffer = malloc(sbuffersize);
-	signed short *stereobuffer = (signed short *)sbuffer;
-
-	char *mbuffer = malloc(aq.buffersize * sizeof(char));
-	signed short *monobuffer = (signed short *)mbuffer;
-
-	haas_init(&aq);
-	while(aq_remove(&aq, mbuffer)!=AQ_STOPPED)
+	int err;
+	if ((err=init_audio_spk(&spk)))
 	{
-		pthread_mutex_lock(&haasmutex);
-		memcpy(delayed, delayed+aq.buffersize, delaybytes); // R
-		memcpy(delayed+delaybytes, (char *)monobuffer, aq.buffersize);
-
-		for(i=j=0;i<aq.bufferframes;i++)
-		{
-			if (haasenabled)
-			{
-				// Haas
-				stereobuffer[j++] = monobuffer[i] * 0.7; // L
-				stereobuffer[j++] = delayedbuffer[i];
-			}
-			else
-			{
-				// Dry, mono -> mono on both sides of stereo
-				stereobuffer[j++] = monobuffer[i]; // L
-				stereobuffer[j++] = monobuffer[i]; // R
-			}
-		}
-		pthread_mutex_unlock(&haasmutex);
-
-		// process stereo frames here
-		sounddelay_add(sbuffer, sbuffersize, &snddly);
-
-		err = snd_pcm_writei(spk.handle, stereobuffer, aq.bufferframes);
-		if (err == -EAGAIN) printf("EAGAIN\n");
-		if (err < 0)
-		{
-			if (xrun_recovery(spk.handle, err) < 0)
-			{
-				printf("Write error: %s\n", snd_strerror(err));
-			}
-		}
+		printf("Init spk error %d\n", err);
 	}
-	haas_close();
-	free(mbuffer);
-	free(sbuffer);
-	close_audio_spk(&spk);
+	else
+	{
+		int i, j;
+		int sbuffersize = aq.bufferframes * stereo * ( snd_pcm_format_width(aq.format) / 8 );
+		char *sbuffer = malloc(sbuffersize);
+		signed short *stereobuffer = (signed short *)sbuffer;
+
+		char *mbuffer = malloc(aq.buffersize * sizeof(char));
+		signed short *monobuffer = (signed short *)mbuffer;
+
+		haas_init(&aq);
+		soundmod_init(modrate, moddepth, aq.format, aq.rate, aq.channels, &sndmod);
+		while(aq_remove(&aq, mbuffer)!=AQ_STOPPED)
+		{
+			pthread_mutex_lock(&haasmutex);
+			memcpy(delayed, delayed+aq.buffersize, delaybytes); // Delay R
+			memcpy(delayed+delaybytes, (char *)monobuffer, aq.buffersize);
+
+			soundmod_add(delayed, aq.buffersize, &sndmod); // Modulate R
+
+			for(i=j=0;i<aq.bufferframes;i++)
+			{
+				if (haasenabled)
+				{
+					// Haas
+					stereobuffer[j++] = monobuffer[i] * 0.7; // L
+					stereobuffer[j++] = delayedbuffer[i];
+				}
+				else
+				{
+					// Dry, mono -> mono on both sides of stereo
+					stereobuffer[j++] = monobuffer[i]; // L
+					stereobuffer[j++] = monobuffer[i]; // R
+				}
+			}
+
+			pthread_mutex_unlock(&haasmutex);
+
+			// process stereo frames here
+			sounddelay_add(sbuffer, sbuffersize, &snddly);
+
+			err = snd_pcm_writei(spk.handle, stereobuffer, aq.bufferframes);
+			if (err == -EAGAIN) printf("EAGAIN\n");
+			if (err < 0)
+			{
+				if (xrun_recovery(spk.handle, err) < 0)
+				{
+					printf("Write error: %s\n", snd_strerror(err));
+				}
+			}
+		}
+		soundmod_close(&sndmod);
+		haas_close();
+		free(mbuffer);
+		free(sbuffer);
+		close_audio_spk(&spk);
+	}
 
 //printf("exiting 2\n");
 	retval_thread2 = 0;
@@ -980,6 +1243,51 @@ static void outputdev_changed(GtkWidget *combo, gpointer data)
 	//printf("Selected id %s\n", strval);
 	create_thread0(a);
 	g_free(strval);
+}
+
+static void mod_toggled(GtkWidget *togglebutton, gpointer data)
+{
+	pthread_mutex_lock(&(sndmod.modmutex));
+
+	sndmod.enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(togglebutton));
+	if (sndmod.enabled)
+	{
+		modrate = (float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spinbutton14));
+		moddepth = (float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(spinbutton15));
+		soundmod_init(modrate, moddepth, sndmod.format, sndmod.rate, sndmod.channels, &sndmod);
+	}
+	else
+	{
+		soundmod_close(&sndmod);
+	}
+	pthread_mutex_unlock(&(sndmod.modmutex));
+	//printf("toggle state %d\n", gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(modenable)));
+}
+
+static void modfreq_changed(GtkWidget *widget, gpointer data)
+{
+	pthread_mutex_lock(&(sndmod.modmutex));
+	float newvalue = (float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(widget));
+	modrate = newvalue;
+	if (sndmod.enabled)
+	{
+		soundmod_close(&sndmod);
+		soundmod_init(newvalue, sndmod.moddepth, sndmod.format, sndmod.rate, sndmod.channels, &sndmod);
+	}
+	pthread_mutex_unlock(&(sndmod.modmutex));
+}
+
+static void moddepth_changed(GtkWidget *widget, gpointer data)
+{
+	pthread_mutex_lock(&(sndmod.modmutex));
+	float newvalue = (float)gtk_spin_button_get_value(GTK_SPIN_BUTTON(widget));
+	moddepth = newvalue;
+	if (sndmod.enabled)
+	{
+		soundmod_close(&sndmod);
+		soundmod_init(sndmod.modfreq, newvalue, sndmod.format, sndmod.rate, sndmod.channels, &sndmod);
+	}
+	pthread_mutex_unlock(&(sndmod.modmutex));
 }
 
 static void haas_toggled(GtkWidget *togglebutton, gpointer data)
@@ -1269,6 +1577,42 @@ int main(int argc, char *argv[])
 	print_card_list(); // Fill input/output devices combo boxes
 	g_signal_connect(GTK_COMBO_BOX(comboinputdev), "changed", G_CALLBACK(inputdev_changed), (gpointer)&aq);
 	g_signal_connect(GTK_COMBO_BOX(combooutputdev), "changed", G_CALLBACK(outputdev_changed), (gpointer)&aq);
+
+
+// modulation frame
+    framemod1 = gtk_frame_new("Modulation");
+    gtk_container_add(GTK_CONTAINER(fxbox), framemod1);
+
+// horizontal box
+    modbox1 = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_container_add(GTK_CONTAINER(framemod1), modbox1);
+
+// checkbox
+	sndmod.enabled = FALSE;
+	modenable = gtk_check_button_new_with_label("Enable");
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(modenable), sndmod.enabled);
+	g_signal_connect(GTK_TOGGLE_BUTTON(modenable), "toggled", G_CALLBACK(mod_toggled), NULL);
+	gtk_container_add(GTK_CONTAINER(modbox1), modenable);
+
+// rate
+	modlabel1 = gtk_label_new("Rate (Hz)");
+	gtk_widget_set_size_request(modlabel1, 100, 30);
+	gtk_container_add(GTK_CONTAINER(modbox1), modlabel1);
+	spinbutton14 = gtk_spin_button_new_with_range(0.1, 20.0, 0.1);
+	gtk_widget_set_size_request(spinbutton14, 120, 30);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(spinbutton14), modrate);
+	g_signal_connect(GTK_SPIN_BUTTON(spinbutton14), "value-changed", G_CALLBACK(modfreq_changed), NULL);
+	gtk_container_add(GTK_CONTAINER(modbox1), spinbutton14);
+
+// depth
+	modlabel2 = gtk_label_new("Depth");
+	gtk_widget_set_size_request(modlabel2, 100, 30);
+	gtk_container_add(GTK_CONTAINER(modbox1), modlabel2);
+	spinbutton15 = gtk_spin_button_new_with_range(0.001, 0.100, 0.001);
+	gtk_widget_set_size_request(spinbutton15, 120, 30);
+	gtk_spin_button_set_value(GTK_SPIN_BUTTON(spinbutton15), moddepth);
+	g_signal_connect(GTK_SPIN_BUTTON(spinbutton15), "value-changed", G_CALLBACK(moddepth_changed), NULL);
+	gtk_container_add(GTK_CONTAINER(modbox1), spinbutton15);
 
 
 // haas frame
